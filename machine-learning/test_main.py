@@ -26,6 +26,11 @@ from immich_ml.models.clip.textual import MClipTextualEncoder, OpenClipTextualEn
 from immich_ml.models.clip.visual import OpenClipVisualEncoder
 from immich_ml.models.facial_recognition.detection import FaceDetector
 from immich_ml.models.facial_recognition.recognition import FaceRecognizer
+from immich_ml.models.facial_recognition.video import (
+    _cosine_similarity,
+    _resize_if_needed,
+    deep_video_face_scan,
+)
 from immich_ml.schemas import ModelFormat, ModelPrecision, ModelTask, ModelType
 from immich_ml.sessions.ann import AnnSession
 from immich_ml.sessions.ort import OrtSession
@@ -828,6 +833,199 @@ class TestFaceRecognition:
         update_dims.assert_not_called()
         onnx.load.assert_not_called()
         onnx.save.assert_not_called()
+
+    # ------------------------------------------------------------------
+    # deep_video_face_scan helpers
+    # ------------------------------------------------------------------
+
+    def test_resize_if_needed_no_op_for_small_frame(self) -> None:
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        result = _resize_if_needed(frame)
+        assert result.shape == (480, 640, 3)
+
+    def test_resize_if_needed_downscales_wide_frame(self) -> None:
+        # 1920x1080 should be scaled to fit within 1280x720
+        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        result = _resize_if_needed(frame)
+        h, w = result.shape[:2]
+        assert h <= 720
+        assert w <= 1280
+        # Aspect ratio preserved (within rounding)
+        assert abs(w / h - 1920 / 1080) < 0.02
+
+    def test_resize_if_needed_downscales_portrait_frame(self) -> None:
+        # Portrait: 1080 wide, 1920 tall
+        frame = np.zeros((1920, 1080, 3), dtype=np.uint8)
+        result = _resize_if_needed(frame)
+        h, w = result.shape[:2]
+        assert h <= 720
+        assert w <= 1280
+        # Aspect ratio preserved (within rounding)
+        assert abs(w / h - 1080 / 1920) < 0.02
+
+    def test_cosine_similarity_identical_vectors(self) -> None:
+        v = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        assert abs(_cosine_similarity(v, v) - 1.0) < 1e-6
+
+    def test_cosine_similarity_orthogonal_vectors(self) -> None:
+        a = np.array([1.0, 0.0], dtype=np.float32)
+        b = np.array([0.0, 1.0], dtype=np.float32)
+        assert abs(_cosine_similarity(a, b)) < 1e-6
+
+    def test_cosine_similarity_zero_vector(self) -> None:
+        a = np.array([1.0, 0.0], dtype=np.float32)
+        z = np.zeros(2, dtype=np.float32)
+        assert _cosine_similarity(a, z) == 0.0
+
+    # ------------------------------------------------------------------
+    # deep_video_face_scan integration
+    # ------------------------------------------------------------------
+
+    def _make_face(
+        self,
+        embedding: np.ndarray,
+        score: float,
+        x1: float = 10.0,
+        y1: float = 10.0,
+        x2: float = 50.0,
+        y2: float = 50.0,
+    ) -> dict:
+        """Build a DetectedFace-style dict as FaceRecognizer would return."""
+        return {
+            "boundingBox": {
+                "x1": np.float32(x1),
+                "y1": np.float32(y1),
+                "x2": np.float32(x2),
+                "y2": np.float32(y2),
+            },
+            "embedding": orjson.dumps(embedding, option=orjson.OPT_SERIALIZE_NUMPY).decode(),
+            "score": np.float32(score),
+        }
+
+    def test_deep_video_face_scan_returns_unique_faces(self, mocker: MockerFixture) -> None:
+        """Two frames with the same person -> only the highest-score detection kept."""
+        mocker.patch.object(FaceDetector, "load")
+        mocker.patch.object(FaceRecognizer, "load")
+        detector = FaceDetector("buffalo_s", cache_dir="test_cache")
+        recognizer = FaceRecognizer("buffalo_s", cache_dir="test_cache")
+
+        embedding = np.ones(512, dtype=np.float32)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        bbox = np.array([[10, 10, 50, 50]], dtype=np.float32)
+        scores_arr = np.array([0.8], dtype=np.float32)
+        kpss = np.random.rand(1, 5, 2).astype(np.float32)
+        detection_output = {"boxes": bbox, "scores": scores_arr, "landmarks": kpss}
+
+        face_low = self._make_face(embedding, score=0.7)
+        face_high = self._make_face(embedding, score=0.9)
+
+        mocker.patch.object(detector, "predict", return_value=detection_output)
+        mocker.patch.object(
+            recognizer,
+            "predict",
+            side_effect=[
+                [face_low],   # frame 1 -> lower score
+                [face_high],  # frame 2 -> higher score
+            ],
+        )
+
+        mocker.patch(
+            "immich_ml.models.facial_recognition.video._sample_frames",
+            return_value=iter([frame, frame]),
+        )
+
+        results = deep_video_face_scan("fake.mp4", detector, recognizer)
+
+        assert len(results) == 1
+        assert results[0]["score"] == np.float32(0.9)
+
+    def test_deep_video_face_scan_returns_distinct_people(self, mocker: MockerFixture) -> None:
+        """Two different people in separate frames -> both detections returned."""
+        mocker.patch.object(FaceDetector, "load")
+        mocker.patch.object(FaceRecognizer, "load")
+        detector = FaceDetector("buffalo_s", cache_dir="test_cache")
+        recognizer = FaceRecognizer("buffalo_s", cache_dir="test_cache")
+
+        emb_a = np.array([1.0] + [0.0] * 511, dtype=np.float32)
+        emb_b = np.array([0.0, 1.0] + [0.0] * 510, dtype=np.float32)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+
+        bbox = np.array([[10, 10, 50, 50]], dtype=np.float32)
+        scores_arr = np.array([0.8], dtype=np.float32)
+        kpss = np.random.rand(1, 5, 2).astype(np.float32)
+        detection_output = {"boxes": bbox, "scores": scores_arr, "landmarks": kpss}
+
+        face_a = self._make_face(emb_a, score=0.8)
+        face_b = self._make_face(emb_b, score=0.75)
+
+        mocker.patch.object(detector, "predict", return_value=detection_output)
+        mocker.patch.object(recognizer, "predict", side_effect=[[face_a], [face_b]])
+        mocker.patch(
+            "immich_ml.models.facial_recognition.video._sample_frames",
+            return_value=iter([frame, frame]),
+        )
+
+        results = deep_video_face_scan("fake.mp4", detector, recognizer)
+
+        assert len(results) == 2
+
+    def test_deep_video_face_scan_no_faces(self, mocker: MockerFixture) -> None:
+        """Frames with no detections -> empty result list."""
+        mocker.patch.object(FaceDetector, "load")
+        mocker.patch.object(FaceRecognizer, "load")
+        detector = FaceDetector("buffalo_s", cache_dir="test_cache")
+        recognizer = FaceRecognizer("buffalo_s", cache_dir="test_cache")
+
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        empty_detection = {
+            "boxes": np.empty((0, 4), dtype=np.float32),
+            "scores": np.empty(0, dtype=np.float32),
+            "landmarks": np.empty((0, 5, 2), dtype=np.float32),
+        }
+
+        mocker.patch.object(detector, "predict", return_value=empty_detection)
+        mocker.patch(
+            "immich_ml.models.facial_recognition.video._sample_frames",
+            return_value=iter([frame]),
+        )
+
+        results = deep_video_face_scan("fake.mp4", detector, recognizer)
+
+        assert results == []
+
+    def test_deep_video_face_scan_result_schema(self, mocker: MockerFixture) -> None:
+        """Each returned face has the expected keys."""
+        mocker.patch.object(FaceDetector, "load")
+        mocker.patch.object(FaceRecognizer, "load")
+        detector = FaceDetector("buffalo_s", cache_dir="test_cache")
+        recognizer = FaceRecognizer("buffalo_s", cache_dir="test_cache")
+
+        embedding = np.ones(512, dtype=np.float32)
+        frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        bbox = np.array([[5, 5, 30, 30]], dtype=np.float32)
+        scores_arr = np.array([0.85], dtype=np.float32)
+        kpss = np.random.rand(1, 5, 2).astype(np.float32)
+        detection_output = {"boxes": bbox, "scores": scores_arr, "landmarks": kpss}
+
+        face = self._make_face(embedding, score=0.85)
+
+        mocker.patch.object(detector, "predict", return_value=detection_output)
+        mocker.patch.object(recognizer, "predict", return_value=[face])
+        mocker.patch(
+            "immich_ml.models.facial_recognition.video._sample_frames",
+            return_value=iter([frame]),
+        )
+
+        results = deep_video_face_scan("fake.mp4", detector, recognizer)
+
+        assert len(results) == 1
+        result = results[0]
+        assert set(result.keys()) == {"boundingBox", "embedding", "score"}
+        assert set(result["boundingBox"].keys()) == {"x1", "y1", "x2", "y2"}
+        parsed_emb = orjson.loads(result["embedding"])
+        assert isinstance(parsed_emb, list)
+        assert len(parsed_emb) == 512
 
 
 @pytest.mark.asyncio
